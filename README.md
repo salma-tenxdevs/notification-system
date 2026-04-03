@@ -1,333 +1,330 @@
-# Scalable Notification System Design
+# Scalable Notification System
 
-## 1. Problem Summary
+## Overview
 
-Design a notification platform that sends user notifications for events such as new messages, shipping updates, and new comments. The platform supports:
+This document describes the design of a large-scale notification system capable of delivering **100 million notifications per day** across multiple channels — in-app, push, and email — to **20 million daily active users**.
 
-- In-app notifications (stored and read later)
-- Push notifications (mobile)
-- Email notifications
+---
 
-Target scale and assumptions:
+## Architecture Overview
 
-- 20 million daily active users
-- 100 million notifications per day
-- Must handle traffic spikes
+```
+                          ┌─────────────────────────────────────────────────┐
+                          │                   API Gateway                   │
+                          │         (Rate Limiting, Auth, Routing)          │
+                          └────────────────────┬────────────────────────────┘
+                                               │
+                          ┌────────────────────▼────────────────────────────┐
+                          │           Notification Service                  │
+                          │  - Validates request                            │
+                          │  - Checks user preferences                      │
+                          │  - Deduplication check (Redis)                  │
+                          │  - Publishes to appropriate queues              │
+                          └──────┬──────────────┬────────────────┬──────────┘
+                                 │              │                │
+                   ┌─────────────▼──┐  ┌────────▼───────┐  ┌────▼───────────┐
+                   │  In-App Queue  │  │  Push Queue     │  │  Email Queue   │
+                   │  (Kafka)       │  │  (Kafka)        │  │  (Kafka)       │
+                   └────────┬───────┘  └────────┬────────┘  └────────┬───────┘
+                            │                   │                     │
+                   ┌────────▼───────┐  ┌────────▼────────┐  ┌────────▼───────┐
+                   │  In-App Worker │  │  Push Worker    │  │  Email Worker  │
+                   │  (stores to DB)│  │  (APNs/FCM)     │  │  (SendGrid)    │
+                   └────────┬───────┘  └─────────────────┘  └────────────────┘
+                            │
+                   ┌────────▼───────────────────────────────────────────────┐
+                   │              PostgreSQL + Redis Cache                  │
+                   │    (notification storage, user preferences, dedup)     │
+                   └────────────────────────────────────────────────────────┘
+```
 
-Average write traffic is about 1,157 notifications/second:
+**Key components:**
+- **API Gateway** — entry point for all incoming requests; handles auth and rate limiting
+- **Notification Service** — core orchestration layer; validates, deduplicates, fans out to queues
+- **Kafka Queues** — one topic per channel (in-app, push, email) for async delivery
+- **Workers** — consume from queues and deliver via third-party providers (FCM, APNs, SendGrid)
+- **PostgreSQL** — stores in-app notifications and user preferences
+- **Redis** — caching for user preferences, deduplication keys, and rate limit counters
 
-- $100,000,000 / 86,400 \approx 1,157$
+---
 
-For spikes, we design for at least 10x burst capacity (~12,000 notifications/second).
+## API Design
 
-## 2. High-Level Architecture
+### 1. Create a Notification
 
-See full diagram in [docs/architecture.md](docs/architecture.md).
+**`POST /v1/notifications`**
 
-Core components:
+Triggered by internal services when an event occurs.
 
-- API Layer: receives notification creation and read requests
-- Notification Service: validates, deduplicates, checks preferences, applies rate limits
-- Queue/Event Bus: decouples ingestion from delivery (Kafka/RabbitMQ/SQS equivalent)
-- Workers: channel-specific delivery workers (in-app, push, email)
-- Database: durable storage for notifications and delivery attempts
-- Cache: Redis for preferences cache, dedupe keys, and rate-limiting counters
-
-## 3. Functional Requirements Mapping
-
-- Create notification when event happens: `POST /v1/notifications` or internal event ingestion
-- Multi-channel delivery: fan-out by channel workers
-- Store in-app notifications: persisted in notification store
-- Respect user preferences: preference lookup (cache + DB fallback)
-- Retry if delivery fails: retry policy with exponential backoff + DLQ
-- Avoid duplicates: idempotency key + dedupe cache/store
-- Basic rate limiting: token bucket/sliding window per user/channel/type
-
-## 4. API Design
-
-### 4.1 Create Notification
-
-`POST /v1/notifications`
-
-Request:
-
+**Request:**
 ```json
 {
-  "eventId": "evt_7f9a2",
-  "userId": "user_123",
-  "type": "NEW_MESSAGE",
-  "channels": ["IN_APP", "PUSH", "EMAIL"],
-  "title": "You received a new message",
-  "body": "Alex sent you a message",
+  "user_id": "usr_123",
+  "type": "new_message",
+  "channels": ["in_app", "push", "email"],
+  "title": "New Message",
+  "body": "You received a new message from Alice.",
   "metadata": {
-    "conversationId": "conv_456",
-    "senderId": "user_888"
-  },
-  "priority": "HIGH",
-  "scheduledAt": "2026-04-03T12:00:00Z",
-  "idempotencyKey": "msg_user_123_conv_456_evt_7f9a2"
+    "sender_id": "usr_456",
+    "thread_id": "thread_789"
+  }
 }
 ```
 
-Response (accepted async):
-
+**Response `201 Created`:**
 ```json
 {
-  "notificationId": "noti_9ab31",
-  "status": "QUEUED",
-  "createdAt": "2026-04-03T12:00:01Z"
+  "notification_id": "notif_abc123",
+  "status": "queued",
+  "created_at": "2025-04-01T10:00:00Z"
 }
 ```
 
-Possible status codes:
+---
 
-- `202 Accepted`: queued for delivery
-- `200 OK`: duplicate request, already processed
-- `400 Bad Request`: invalid input
-- `429 Too Many Requests`: rate limit exceeded
+### 2. Get Notifications for a User
 
-### 4.2 Get In-App Notifications
+**`GET /v1/users/{user_id}/notifications`**
 
-`GET /v1/users/{userId}/notifications?cursor=abc123&limit=20&unreadOnly=true`
+Used by the client app to fetch in-app notifications.
 
-Response:
+**Query Parameters:**
 
+| Param    | Type    | Description                             |
+|----------|---------|-----------------------------------------|
+| `limit`  | integer | Max results (default: 20, max: 100)     |
+| `cursor` | string  | Pagination cursor (last seen ID)        |
+| `unread` | boolean | Filter to unread only (default: false)  |
+
+**Response `200 OK`:**
 ```json
 {
-  "items": [
+  "notifications": [
     {
-      "notificationId": "noti_9ab31",
-      "type": "NEW_MESSAGE",
-      "title": "You received a new message",
-      "body": "Alex sent you a message",
-      "status": "UNREAD",
-      "createdAt": "2026-04-03T12:00:01Z",
-      "metadata": {
-        "conversationId": "conv_456"
-      }
+      "notification_id": "notif_abc123",
+      "type": "new_message",
+      "title": "New Message",
+      "body": "You received a new message from Alice.",
+      "read": false,
+      "created_at": "2025-04-01T10:00:00Z"
     }
   ],
-  "nextCursor": "abc124"
+  "next_cursor": "notif_xyz999",
+  "unread_count": 5
 }
 ```
 
-### 4.3 Mark Notification Read (optional but practical)
+---
 
-`PATCH /v1/users/{userId}/notifications/{notificationId}`
+### 3. Mark Notifications as Read
 
-Request:
+**`PATCH /v1/users/{user_id}/notifications/read`**
 
+**Request:**
 ```json
 {
-  "status": "READ"
+  "notification_ids": ["notif_abc123", "notif_def456"]
 }
 ```
 
-Response:
-
+**Response `200 OK`:**
 ```json
 {
-  "notificationId": "noti_9ab31",
-  "status": "READ",
-  "updatedAt": "2026-04-03T12:02:10Z"
+  "updated": 2
 }
 ```
 
-## 5. Data Model
+---
 
-Use a polyglot approach:
+### 4. Update User Notification Preferences
 
-- OLTP store (PostgreSQL/MySQL) for control tables
-- Wide-column or partitioned store (Cassandra/DynamoDB) for high-volume in-app notifications
-- Redis for hot cache, dedupe TTL keys, and rate limiting
+**`PUT /v1/users/{user_id}/preferences`**
 
-### 5.1 `user_notification_preferences`
+**Request:**
+```json
+{
+  "channels": {
+    "push": true,
+    "email": false,
+    "in_app": true
+  },
+  "quiet_hours": {
+    "enabled": true,
+    "start": "22:00",
+    "end": "08:00",
+    "timezone": "America/New_York"
+  }
+}
+```
 
-Purpose: per-user, per-type, per-channel settings.
+**Response `200 OK`:**
+```json
+{
+  "updated": true
+}
+```
 
-Fields:
+---
 
-- `user_id` (PK part)
-- `notification_type` (PK part)
-- `channel` (PK part: IN_APP/PUSH/EMAIL)
-- `enabled` (bool)
-- `updated_at`
+## Data Model
 
-Indexes:
+### `notifications` table (PostgreSQL)
 
-- PK `(user_id, notification_type, channel)`
+Stores all in-app notifications.
 
-### 5.2 `notification_events`
+| Column            | Type        | Description                                      |
+|-------------------|-------------|--------------------------------------------------|
+| `id`              | UUID (PK)   | Unique notification ID                           |
+| `user_id`         | UUID (FK)   | Recipient user                                   |
+| `type`            | VARCHAR     | Event type (e.g., `new_message`, `order_shipped`)|
+| `title`           | VARCHAR     | Short notification title                         |
+| `body`            | TEXT        | Full notification body                           |
+| `metadata`        | JSONB       | Extra context (sender ID, order ID, etc.)        |
+| `read`            | BOOLEAN     | Whether the user has read it                     |
+| `created_at`      | TIMESTAMPTZ | When the notification was created                |
+| `delivered_at`    | TIMESTAMPTZ | When it was delivered to the client              |
 
-Purpose: idempotent record of event ingestion.
+**Indexes:**
+- `(user_id, created_at DESC)` — primary query pattern (fetch recent notifications by user)
+- `(user_id, read)` — supports unread count queries
 
-Fields:
+---
 
-- `idempotency_key` (PK)
-- `event_id`
-- `user_id`
-- `type`
-- `payload_json`
-- `created_at`
+### `user_preferences` table (PostgreSQL)
 
-Indexes:
+| Column         | Type      | Description                                  |
+|----------------|-----------|----------------------------------------------|
+| `user_id`      | UUID (PK) | The user                                     |
+| `push_enabled` | BOOLEAN   | Whether push notifications are on            |
+| `email_enabled`| BOOLEAN   | Whether email notifications are on           |
+| `in_app_enabled`| BOOLEAN  | Whether in-app notifications are on          |
+| `quiet_hours`  | JSONB     | Quiet hours window and timezone              |
+| `updated_at`   | TIMESTAMPTZ | Last time preferences were changed         |
 
-- PK `idempotency_key`
-- Secondary index `(user_id, created_at desc)` for debug/audit
+**Caching:** User preferences are cached in Redis with a 5-minute TTL to avoid a DB hit on every notification.
 
-### 5.3 `in_app_notifications`
+---
 
-Purpose: user inbox for in-app channel.
+### `notification_dedup_log` (Redis)
 
-Fields:
+To prevent duplicate notifications, a Redis key is set for each (user_id, event_id) pair with a TTL of 24 hours.
 
-- `user_id` (partition key)
-- `notification_id` (clustering key/time sortable)
-- `type`
-- `title`
-- `body`
-- `metadata_json`
-- `status` (UNREAD/READ)
-- `created_at`
-- `expires_at` (optional TTL/retention)
+```
+Key:   dedup:{user_id}:{event_id}
+Value: 1
+TTL:   86400 seconds (24 hours)
+```
 
-Indexes/access:
+If the key already exists, the notification is dropped before being queued.
 
-- Primary access pattern: by `user_id`, sorted by newest
-- Optional GSI/index on `(user_id, status, created_at)` for unread-first queries
+---
 
-### 5.4 `delivery_attempts`
+## Scaling Strategy
 
-Purpose: track delivery outcomes and retries by channel.
+### Horizontal Scaling
 
-Fields:
+- **Notification Service**: Stateless — scale horizontally behind a load balancer. Multiple instances can run in parallel.
+- **Workers**: Each channel has its own consumer group in Kafka, allowing independent scaling. Push workers can be scaled up separately from email workers.
+- **PostgreSQL**: Use read replicas for notification reads (the majority of traffic). Writes go to the primary.
 
-- `attempt_id` (PK)
-- `notification_id`
-- `user_id`
-- `channel`
-- `provider_message_id`
-- `status` (PENDING/SENT/FAILED)
-- `error_code`
-- `attempt_number`
-- `next_retry_at`
-- `created_at`
+### Sharding
 
-Indexes:
+The `notifications` table is sharded by `user_id` using consistent hashing:
 
-- `(notification_id, channel)`
-- `(status, next_retry_at)` for retry scanner
+- 16 shards initially, each shard on its own PostgreSQL instance.
+- `user_id % 16` determines the shard.
+- Allows independent scaling of individual shards as usage grows.
 
-## 6. Scaling Strategy
+### Caching Strategy
 
-### 6.1 Horizontal Scaling
+| Data                  | Cache Layer | TTL        |
+|-----------------------|-------------|------------|
+| User preferences      | Redis       | 5 minutes  |
+| Unread count          | Redis       | 60 seconds |
+| Deduplication keys    | Redis       | 24 hours   |
+| Rate limit counters   | Redis       | 1 minute   |
 
-- Stateless API servers behind load balancer
-- Partitioned queue topics by `user_id` hash to keep ordering per user
-- Separate worker pools per channel (push/email/in-app) to isolate failures
+### Kafka Topic Configuration
 
-### 6.2 Data Partitioning and Sharding
+- **3 topics**: `notifications.in_app`, `notifications.push`, `notifications.email`
+- **32 partitions per topic** — allows 32 parallel consumer workers per channel
+- **Replication factor: 3** — ensures no message loss on broker failure
 
-- Shard in-app notification storage by `hash(user_id) % N`
-- Keep user data co-located by user shard for predictable reads
-- Use time-based bucketing to manage very large partitions
+---
 
-### 6.3 Caching
+## Reliability & Failure Handling
 
-- Cache preferences in Redis with TTL
-- Cache user-level mute/rate-limit state in Redis
-- Read-through cache with DB fallback
+### Retries
 
-### 6.4 Backpressure and Spike Handling
+Workers use an **exponential backoff** retry strategy:
 
-- Queue absorbs burst traffic
-- Autoscale workers on queue lag and throughput metrics
-- Priority queues (critical notifications before low priority)
+| Attempt | Wait       |
+|---------|------------|
+| 1st     | immediate  |
+| 2nd     | 30 seconds |
+| 3rd     | 5 minutes  |
+| 4th     | 30 minutes |
+| 5th+    | Dead-letter queue (DLQ) |
 
-## 7. Reliability and Failure Handling
+After 5 failed attempts, the message is sent to a dead-letter queue (DLQ) for manual inspection or alerting. Operations staff can replay DLQ messages after the root cause is resolved.
 
-### 7.1 Retry Policy
+### Deduplication
 
-- At-least-once delivery via queue semantics
-- Exponential backoff retries (example: 1m, 5m, 15m, 1h)
-- Max retry count, then move to DLQ for manual/automated reprocessing
+Deduplication happens at two levels:
 
-### 7.2 Duplicate Prevention
+1. **Before queuing** — The Notification Service checks Redis for a dedup key. If found, the notification is dropped.
+2. **In the worker** — Workers check an idempotency key before writing to the DB or calling third-party APIs.
 
-- Require `idempotencyKey` for create API
-- Use Redis `SETNX` + TTL and durable `notification_events` check
-- Workers are idempotent: skip if `(notification_id, channel)` already delivered
+This protects against duplicates even in cases of worker crashes or Kafka redelivery.
 
-### 7.3 Channel Provider Failures
+### Rate Limiting
 
-- Circuit breaker for external push/email providers
-- Fallback provider option (if available)
-- Persist failed attempts for observability and replay
+- Per-user rate limits are enforced in Redis using a sliding window counter.
+- Default: max 50 notifications per user per hour.
+- If the limit is exceeded, the notification is dropped and logged (not queued).
+- This prevents spam in runaway event scenarios.
 
-### 7.4 High Availability
+### Failure Scenarios
 
-- Multi-AZ deployment for API, queue brokers, and DB replicas
-- Health checks + auto failover
-- No single point of failure in synchronous request path
+| Failure                     | Behavior                                               |
+|-----------------------------|--------------------------------------------------------|
+| Notification Service crash  | Kafka retains unprocessed messages; workers catch up   |
+| Worker crash                | Kafka redelivers message to another worker instance    |
+| Redis down                  | Fail open: skip dedup/cache, proceed with DB queries   |
+| DB primary down             | Failover to replica within ~30 seconds (auto-failover) |
+| FCM/APNs unavailable        | Retry via backoff; fall back to in-app only            |
+| SendGrid unavailable        | Retry via backoff; alert on-call if sustained failure  |
 
-### 7.5 Consistency Model
+---
 
-- Eventual consistency accepted:
-  - Notification may appear in-app slightly before/after push/email send
-  - User preference updates may take short time to propagate through cache
+## Tradeoffs
 
-## 8. Key Tradeoffs
+### 1. Push vs. Pull (In-App Notifications)
 
-1. Push vs Pull:
+**Push model (WebSocket/SSE):** The server pushes new notifications to the client in real time. Low latency and great UX, but maintaining persistent connections for 20M users is resource-intensive.
 
-- Push gives low latency but needs provider dependencies and retry complexity.
-- Pull (fetch in-app) is simpler but users see updates only when opening app.
+**Pull model (Polling):** The client polls `GET /notifications` every N seconds. Much simpler to scale, but adds latency and wastes bandwidth.
 
-2. Consistency vs Latency:
+**Decision:** Use **pull with polling** for now (simpler, cheaper). Add WebSocket push for premium/real-time features later as a targeted optimization.
 
-- Waiting for all channels synchronously increases latency and failure risk.
-- Async fan-out lowers latency and improves availability, but introduces eventual consistency.
+---
 
-3. Sync vs Async Processing:
+### 2. Consistency vs. Latency
 
-- Sync delivery gives immediate result but cannot scale well under spikes.
-- Async queue-based design handles bursts and isolates failures, with added operational complexity.
+Strong consistency (waiting for all DB replicas to confirm a write before responding) adds significant latency at scale.
 
-4. Fan-out on Write vs Fan-out on Read:
+**Decision:** Accept **eventual consistency**. Notification writes go to the primary DB and are replicated asynchronously to read replicas. A user may briefly see a stale unread count — this is acceptable for a notification system.
 
-- Fan-out on write speeds reads (good for inbox UX) but increases write/storage cost.
-- Fan-out on read reduces write amplification but makes reads slower and more complex.
+---
 
-## 9. End-to-End Request Flow
+### 3. Sync vs. Async Delivery
 
-1. Producer service emits business event (message/order/comment).
-2. Notification API receives create request and validates payload.
-3. Service checks dedupe key, user preferences, and rate limits.
-4. Service writes idempotent event record and publishes channel jobs to queue.
-5. Channel workers consume jobs, call providers/store in-app data, and log attempts.
-6. Failed jobs are retried with backoff; final failures go to DLQ.
-7. Client fetches in-app notifications via paginated API.
+Delivering notifications synchronously (in the request handler) would be simple but would couple API latency to third-party providers (FCM, email) and create backpressure during spikes.
 
-## 10. Operational Metrics (What to Monitor)
+**Decision:** Use **async delivery via Kafka**. The API responds immediately after queuing the notification. This decouples the API from delivery speed, absorbs traffic spikes naturally, and enables retries without blocking users.
 
-- API latency (`p50`, `p95`, `p99`)
-- Queue lag by topic/partition
-- Worker success/failure rate by channel
-- Retry and DLQ counts
-- Duplicate drop count
-- Rate-limit rejection count
-- In-app read latency and unread fetch latency
+---
 
-## 11. Security and Privacy (Basic)
+## Summary
 
-- Encrypt PII in transit and at rest
-- Signed/authenticated internal APIs
-- Audit logs for notification sends and preference changes
-- Data retention policy (for old notifications and delivery logs)
-
-## 12. Future Improvements
-
-- User timezone-aware quiet hours
-- Digest mode (batch non-urgent notifications)
-- ML ranking/prioritization to reduce notification fatigue
-- Multi-provider smart routing based on delivery performance
+This design prioritizes simplicity, horizontal scalability, and fault tolerance. By using Kafka as the backbone for async delivery, Redis for fast lookups and deduplication, and PostgreSQL with sharding for persistent storage, the system can comfortably handle 100M notifications/day while remaining operable and debuggable by a small team.
